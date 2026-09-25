@@ -7,13 +7,10 @@ import comfy.model_management as model_management
 import comfy.model_patcher
 import comfy.sd as comfy_sd
 import comfy.utils
+import folder_paths
 from comfy_api.latest import ComfyExtension, io
 
 from .qwen2d_arch import Qwen2DVAE
-
-
-_PATCH_INSTALLED_ATTR = "_anzhc_qwen2d_patch_installed"
-_ORIGINAL_INIT_ATTR = "_anzhc_qwen2d_original_init"
 
 
 def _is_qwen2d_state_dict(sd):
@@ -298,31 +295,65 @@ def _init_qwen2d_vae(vae, sd, device=None, dtype=None):
     vae.model_size()
 
 
-def install_qwen2d_patch():
-    if getattr(comfy_sd.VAE, _PATCH_INSTALLED_ATTR, False):
-        return
+def _build_qwen2d_vae(sd, device=None):
+    if not _is_qwen2d_state_dict(sd):
+        raise RuntimeError(
+            "Not a Qwen2D VAE state dict. Use the standard VAELoader node for "
+            "other VAE types (SD1.x/SDXL, video, 3D, etc.)."
+        )
+    # Bypass comfy.sd.VAE.__init__ (which assumes a 2D/known-arch VAE and would
+    # reject the Qwen2D state dict) and build the VAE via the Qwen2D path. This
+    # replaces the former global VAE.__init__ monkey-patch, so the official
+    # VAELoader is no longer touched and 3D/video VAEs load unmodified.
+    vae = comfy_sd.VAE.__new__(comfy_sd.VAE)
+    _init_qwen2d_vae(vae, sd, device=device)
+    vae.throw_exception_if_invalid()
+    return vae
 
-    original_init = comfy_sd.VAE.__init__
 
-    def patched_init(self, sd=None, device=None, config=None, dtype=None, metadata=None):
+def _load_qwen2d_vae_patcher(vae_path, metadata=None, device=None):
+    """Reload a disk-backed Qwen2D VAE and return its patcher.
+
+    Mirrors comfy.sd.load_vae_patcher but builds the VAE via the Qwen2D path so
+    multigpu deepclones (Select VAE Device, etc.) keep working without the
+    global VAE.__init__ patch.
+    """
+    if metadata is None:
+        sd, metadata = comfy.utils.load_torch_file(vae_path, return_metadata=True)
+    else:
+        sd = comfy.utils.load_torch_file(vae_path)
+    sd = _maybe_convert_diffusers_vae_state_dict(sd)
+    return _build_qwen2d_vae(sd, device=device).patcher
+
+
+class Qwen2DVAELoader(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Qwen2DVAELoader",
+            display_name="Load Qwen2D VAE",
+            category="model/loaders",
+            inputs=[
+                io.Combo.Input("vae_name", options=folder_paths.get_filename_list("vae")),
+            ],
+            outputs=[
+                io.Vae.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, vae_name) -> io.NodeOutput:
+        vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
+        sd, metadata = comfy.utils.load_torch_file(vae_path, return_metadata=True)
         sd = _maybe_convert_diffusers_vae_state_dict(sd)
-        if config is None and _is_qwen2d_state_dict(sd):
-            _init_qwen2d_vae(self, sd, device=device, dtype=dtype)
-            return
-        return original_init(self, sd=sd, device=device, config=config, dtype=dtype, metadata=metadata)
-
-    comfy_sd.VAE.__init__ = patched_init
-    setattr(comfy_sd.VAE, _ORIGINAL_INIT_ATTR, original_init)
-    setattr(comfy_sd.VAE, _PATCH_INSTALLED_ATTR, True)
-    logging.info("Installed Qwen2D VAE custom-node patch.")
+        vae = _build_qwen2d_vae(sd)
+        vae.patcher.cached_patcher_init = (_load_qwen2d_vae_patcher, (vae_path, metadata, None))
+        return io.NodeOutput(vae)
 
 
 class Qwen2DExtension(ComfyExtension):
-    async def on_load(self) -> None:
-        install_qwen2d_patch()
-
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return []
+        return [Qwen2DVAELoader]
 
 
 async def comfy_entrypoint():
